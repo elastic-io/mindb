@@ -314,7 +314,7 @@ func TestStreamOperations(t *testing.T) {
 		reader := bytes.NewReader(testData)
 
 		etag, err := s.PutObjectStream(testBucket, "stream-test", reader,
-			int64(len(testData)), "application/octet-stream", nil)
+			int64(len(testData)), "application/octet-stream", nil, nil)
 		assert.NoError(t, err)
 		assert.NotEmpty(t, etag)
 

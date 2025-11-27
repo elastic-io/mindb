@@ -278,7 +278,7 @@ func BenchmarkPutObjectStream(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				reader := bytes.NewReader(testData)
 				_, err := s.PutObjectStream(testBucket, fmt.Sprintf("stream-test-%d", i),
-					reader, int64(size), "application/octet-stream", nil)
+					reader, int64(size), "application/octet-stream", nil, nil)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -310,7 +310,7 @@ func BenchmarkGetObjectStream(b *testing.B) {
 			testData := generateBenchmarkData(size)
 			reader := bytes.NewReader(testData)
 			_, err = s.PutObjectStream(testBucket, "stream-benchmark",
-				reader, int64(size), "application/octet-stream", nil)
+				reader, int64(size), "application/octet-stream", nil, nil)
 			if err != nil {
 				b.Fatal(err)
 			}
