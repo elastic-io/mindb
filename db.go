@@ -835,6 +835,50 @@ func (s *DB) getObjectMetadataPath(bucket, key string) string {
 	return s.getObjectPath(bucket, key) + metadataExt
 }
 
+// ObjectExists 检查对象是否存在
+func (s *DB) ObjectExists(bucket, key string) (bool, error) {
+	start := time.Now()
+	atomic.AddInt64(&s.metrics.ActiveReads, 1)
+	defer func() {
+		atomic.AddInt64(&s.metrics.ActiveReads, -1)
+		latency := time.Since(start).Nanoseconds()
+		// 更新平均延迟（可选，因为这是轻量级操作）
+		atomic.StoreInt64(&s.metrics.AvgReadLatency, latency)
+
+		if r := recover(); r != nil {
+			s.log.Errorf("Recovered from panic in ObjectExists: %v\n%s", r, debug.Stack())
+		}
+	}()
+
+	// 首先检查桶是否存在
+	exists, err := s.BucketExists(bucket)
+	if err != nil {
+		return false, fmt.Errorf("failed to check bucket existence: %w", err)
+	}
+	if !exists {
+		return false, nil
+	}
+
+	objectPath := s.getObjectPath(bucket, key)
+	
+	// 获取读锁（轻量级操作，使用读锁即可）
+	objLock := s.getObjectLock(bucket, key)
+	objLock.RLock()
+	defer objLock.RUnlock()
+
+	// 检查对象文件是否存在
+	_, err = os.Stat(objectPath)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		atomic.AddInt64(&s.metrics.ErrorCount, 1)
+		return false, fmt.Errorf("failed to check object existence: %w", err)
+	}
+
+	return true, nil
+}
+
 // ListObjects 列出存储桶中的对象
 func (s *DB) ListObjects(bucket, prefix, marker, delimiter string, maxKeys int) ([]ObjectInfo, []string, error) {
 	bucketLock := s.getBucketLock(bucket)
@@ -1816,7 +1860,7 @@ func (s *DB) GetObjectStream(bucket, key string) (io.ReadCloser, *ObjectData, er
 }
 
 // PutObjectStream 流式存储对象（用于大文件）
-func (s *DB) PutObjectStream(bucket, key string, reader io.Reader, size int64, contentType string, metadata map[string]string) (string, error) {
+func (s *DB) PutObjectStream(bucket, key string, reader io.Reader, size int64, contentType string, metadata map[string]string, progressWriter io.Writer) (string, error) {
 	start := time.Now()
 	atomic.AddInt64(&s.metrics.ActiveWrites, 1)
 	defer func() {
@@ -1880,8 +1924,13 @@ func (s *DB) PutObjectStream(bucket, key string, reader io.Reader, size int64, c
 	hasher := s.getHasher()
 	defer s.putHasher(hasher)
 
-	// 多路写入：文件 + 哈希计算
-	multiWriter := io.MultiWriter(file, hasher)
+	// 多路写入：文件 + 哈希计算 + 进度输出（如果提供）
+	var multiWriter io.Writer
+	if progressWriter != nil {
+		multiWriter = io.MultiWriter(file, hasher, progressWriter)
+	} else {
+		multiWriter = io.MultiWriter(file, hasher)
+	}
 
 	var written int64
 	if size > 0 {
