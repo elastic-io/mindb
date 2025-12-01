@@ -2416,6 +2416,175 @@ func (s *DB) Validate() error {
 	return nil
 }
 
+// RenameObject 重命名对象（高性能版本）
+// 使用 os.Rename 实现最高性能的原子重命名操作
+func (s *DB) RenameObject(bucket, oldKey, newKey string) error {
+	start := time.Now()
+	atomic.AddInt64(&s.metrics.ActiveWrites, 1)
+	defer func() {
+		atomic.AddInt64(&s.metrics.ActiveWrites, -1)
+		atomic.AddInt64(&s.metrics.WriteOps, 1)
+		latency := time.Since(start).Nanoseconds()
+		atomic.StoreInt64(&s.metrics.AvgWriteLatency, latency)
+
+		if r := recover(); r != nil {
+			s.log.Errorf("Recovered from panic in RenameObject: %v\n%s", r, debug.Stack())
+		}
+	}()
+
+	// 验证输入参数
+	if bucket == "" || oldKey == "" || newKey == "" {
+		atomic.AddInt64(&s.metrics.ErrorCount, 1)
+		return fmt.Errorf("bucket, oldKey and newKey cannot be empty")
+	}
+
+	if oldKey == newKey {
+		return nil // 相同的key，无需操作
+	}
+
+	// 检查存储桶是否存在
+	exists, err := s.BucketExists(bucket)
+	if err != nil {
+		atomic.AddInt64(&s.metrics.ErrorCount, 1)
+		return fmt.Errorf("failed to check bucket existence: %w", err)
+	}
+	if !exists {
+		atomic.AddInt64(&s.metrics.ErrorCount, 1)
+		return fmt.Errorf("bucket %s does not exist", bucket)
+	}
+
+	// 获取源对象和目标对象的路径
+	oldObjectPath := s.getObjectPath(bucket, oldKey)
+	oldMetadataPath := s.getObjectMetadataPath(bucket, oldKey)
+	newObjectPath := s.getObjectPath(bucket, newKey)
+	newMetadataPath := s.getObjectMetadataPath(bucket, newKey)
+
+	// 按字典序获取锁，避免死锁
+	var firstLock, secondLock *sync.RWMutex
+	var firstKey, secondKey string
+	
+	if oldKey < newKey {
+		firstLock = s.getObjectLock(bucket, oldKey)
+		secondLock = s.getObjectLock(bucket, newKey)
+		firstKey, secondKey = oldKey, newKey
+	} else {
+		firstLock = s.getObjectLock(bucket, newKey)
+		secondLock = s.getObjectLock(bucket, oldKey)
+		firstKey, secondKey = newKey, oldKey
+	}
+
+	// 获取锁
+	firstLock.Lock()
+	defer firstLock.Unlock()
+	
+	if firstKey != secondKey {
+		secondLock.Lock()
+		defer secondLock.Unlock()
+	}
+
+	// 检查源对象是否存在
+	if _, err := os.Stat(oldObjectPath); os.IsNotExist(err) {
+		atomic.AddInt64(&s.metrics.ErrorCount, 1)
+		return fmt.Errorf("source object %s does not exist", oldKey)
+	}
+
+	// 检查目标对象是否已存在
+	if _, err := os.Stat(newObjectPath); err == nil {
+		atomic.AddInt64(&s.metrics.ErrorCount, 1)
+		return fmt.Errorf("destination object %s already exists", newKey)
+	}
+
+	// 确保目标目录存在
+	if err := os.MkdirAll(filepath.Dir(newObjectPath), dirPerm); err != nil {
+		atomic.AddInt64(&s.metrics.ErrorCount, 1)
+		return fmt.Errorf("failed to create destination directory: %w", err)
+	}
+
+	// 使用 os.Rename 进行高性能原子重命名
+	// 1. 重命名对象文件（原子操作）
+	if err := os.Rename(oldObjectPath, newObjectPath); err != nil {
+		atomic.AddInt64(&s.metrics.ErrorCount, 1)
+		return fmt.Errorf("failed to rename object file: %w", err)
+	}
+
+	// 2. 处理元数据文件
+	if _, err := os.Stat(oldMetadataPath); err == nil {
+		// 确保新元数据目录存在
+		if err := os.MkdirAll(filepath.Dir(newMetadataPath), dirPerm); err != nil {
+			// 回滚：将对象文件重命名回去
+			os.Rename(newObjectPath, oldObjectPath)
+			atomic.AddInt64(&s.metrics.ErrorCount, 1)
+			return fmt.Errorf("failed to create new metadata directory: %w", err)
+		}
+
+		// 读取并更新元数据
+		metaData, err := s.readFileOptimized(oldMetadataPath)
+		if err != nil {
+			// 回滚：将对象文件重命名回去
+			os.Rename(newObjectPath, oldObjectPath)
+			atomic.AddInt64(&s.metrics.ErrorCount, 1)
+			return fmt.Errorf("failed to read old metadata: %w", err)
+		}
+
+		// 解析元数据并更新key
+		objectData := &ObjectData{}
+		if err := objectData.UnmarshalJSON(metaData); err != nil {
+			// 回滚：将对象文件重命名回去
+			os.Rename(newObjectPath, oldObjectPath)
+			atomic.AddInt64(&s.metrics.ErrorCount, 1)
+			return fmt.Errorf("failed to parse metadata: %w", err)
+		}
+
+		// 更新key和时间戳
+		objectData.Key = newKey
+		objectData.LastModified = time.Now()
+		
+		newMetaData, err := objectData.MarshalJSON()
+		if err != nil {
+			// 回滚：将对象文件重命名回去
+			os.Rename(newObjectPath, oldObjectPath)
+			atomic.AddInt64(&s.metrics.ErrorCount, 1)
+			return fmt.Errorf("failed to marshal new metadata: %w", err)
+		}
+
+		// 写入新元数据
+		err = s.withRetry(func() error {
+			return s.atomicWriteWithVerify(newMetadataPath, newMetaData, CalculateETag(newMetaData))
+		})
+		
+		if err != nil {
+			// 回滚：将对象文件重命名回去
+			os.Rename(newObjectPath, oldObjectPath)
+			atomic.AddInt64(&s.metrics.ErrorCount, 1)
+			return fmt.Errorf("failed to write new metadata: %w", err)
+		}
+
+		// 删除旧元数据文件
+		os.Remove(oldMetadataPath) // 忽略错误
+	}
+
+	// 3. 清理空目录
+	s.cleanupEmptyDirPath(filepath.Dir(oldObjectPath))
+
+	s.log.Infof("Successfully renamed object from %s to %s in bucket %s", oldKey, newKey, bucket)
+	return nil
+}
+
+// cleanupEmptyDirPath 清理指定路径的空目录（辅助方法）
+func (s *DB) cleanupEmptyDirPath(dirPath string) {
+	// 最多清理两级目录（哈希分片目录结构）
+	for i := 0; i < 2; i++ {
+		if entries, err := os.ReadDir(dirPath); err == nil && len(entries) == 0 {
+			if err := os.Remove(dirPath); err != nil {
+				break // 如果删除失败，停止清理
+			}
+			dirPath = filepath.Dir(dirPath)
+		} else {
+			break
+		}
+	}
+}
+
 type Logger interface {
 	// Debug logs the provided arguments at [DebugLevel].
 	// Spaces are added between arguments when neither is a string.
